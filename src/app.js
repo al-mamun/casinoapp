@@ -299,4 +299,7 @@ async function startServer() {
     }
 }
 
-if (require.main === module
+if (require.main === module && !process.env.VERCEL) startServer();
+process.on("unhandledRejection", (err) => console.error("Unhandled Promise Rejection:", err));
+
+module.exports = app;
