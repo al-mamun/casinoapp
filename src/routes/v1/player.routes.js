@@ -1769,6 +1769,22 @@ router.all("/game-callback", async (req, res) => {
             return res.status(404).json({ success: false, message: reason, errorCode: "WALLET_NOT_FOUND" });
         }
 
+        // Sync: use User.balance when it's higher than wallet.balance.
+        // On Vercel the startup normalizer doesn't run, so wallet.balance can lag behind User.balance.
+        try {
+            const userRow = await User.findByPk(Number(user.id));
+            const userBal   = Number(userRow?.balance || 0);
+            const walletBal = Number(wallet.balance   || 0);
+            if (userBal > walletBal) {
+                wallet.balance = userBal;
+                const wc = await Wallet.collection();
+                await wc.updateMany(
+                    { userId: { $in: [Number(user.id), String(user.id)] } },
+                    { $set: { balance: userBal, updatedAt: new Date() } }
+                );
+            }
+        } catch {}
+
         const balanceBefore = Number(wallet.balance || 0);
         // IMPORTANT: timestamp is intentionally excluded from referenceId.
         // HighAPI retries failed callbacks with a new timestamp each time.
@@ -1827,21 +1843,20 @@ router.all("/game-callback", async (req, res) => {
         // Update cache immediately so next callback sees the new balance
         cacheWallet(user.id, after);
 
-        // credit_amount per HighAPI PHP docs = max(0, bet-win) — the net amount deducted from the player.
-        // balance = player's new balance as a NUMBER (not a string).
-        const creditAmount = Number(Math.max(0, bet - win).toFixed(2));
+        // credit_amount in HighAPI seamless-wallet settle response = player's CURRENT balance after the transaction.
+        // (NOT the net deduction — that interpretation caused balance to show 0 whenever win >= bet.)
         const responseBody = {
             status: 1,
             errCode: 0,
             error_code: 0,
-            credit_amount: creditAmount,
+            credit_amount: after,
             balance: after,
             current_balance: after,
             player_balance: after,
             available_balance: after,
             timestamp: Math.floor(Date.now() / 1000)
         };
-        console.log(`[game-callback] FAST response credit_amount=${creditAmount} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
+        console.log(`[game-callback] FAST response credit_amount=${after} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
         res.json(responseBody);
 
         // === BACKGROUND DB WRITES (fire-and-forget) ===
@@ -2031,6 +2046,21 @@ router.all("/game-balance", async (req, res) => {
 router.get("/game-callback-debug", authenticate, authorize("BANKING:VIEW"), async (req, res) => {
     const logs = await getSetting("game_callback_debug");
     return success(res, Array.isArray(logs) ? logs : []);
+});
+
+// Temporary diagnostic endpoint — no auth, shows callback receipt status only
+router.get("/callback-status", async (req, res) => {
+    const logs = await getSetting("game_callback_debug").catch(() => []);
+    const arr  = Array.isArray(logs) ? logs : [];
+    const last = arr[0] || null;
+    res.json({
+        callbacksLogged: arr.length,
+        lastCallbackAt:  last?.at || null,
+        lastSettlementType: last?.parsed?.settlementType || null,
+        lastUserId:      last?.parsed?.callbackUserRef  || null,
+        lastResponse:    last?.response                 || null,
+        serverTime:      new Date().toISOString()
+    });
 });
 
 // Debug endpoint: shows raw MongoDB wallet + user state for the authenticated player.

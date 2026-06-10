@@ -29,8 +29,11 @@ app.use(helmet({
 const allowedOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
 app.use(cors({
     origin(origin, callback) {
+        // Allow requests with no origin (mobile apps, curl, server-to-server)
         if (!origin) return callback(null, true);
-        if (process.env.NODE_ENV !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+        // Always allow localhost in any environment for local frontend dev
+        if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+        // Allow explicitly listed origins
         if (!allowedOrigins.length || allowedOrigins.includes(origin)) return callback(null, true);
         return callback(new Error("Origin not allowed by CORS"));
     },
@@ -296,7 +299,4 @@ async function startServer() {
     }
 }
 
-if (require.main === module && !process.env.VERCEL) startServer();
-process.on("unhandledRejection", (err) => console.error("Unhandled Promise Rejection:", err));
-
-module.exports = app;
+if (require.main === module
