@@ -2,7 +2,7 @@ const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const { normalizeRole } = require("../utils/normalizeRole");
 
-const JWT_SECRET = process.env.JWT_SECRET || 'SUPER_SECRET_KEY_123';
+const { JWT_SECRET } = require("../config");
 
 // Main auth middleware — verifies JWT token + session validation
 const authenticate = async (req, res, next) => {
@@ -15,7 +15,7 @@ const authenticate = async (req, res, next) => {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         const fullAccessMode = !!decoded.fullAccessMode;
-        const disableRbac = String(process.env.DISABLE_RBAC || (process.env.NODE_ENV !== "production" ? "true" : "false")).toLowerCase() === "true";
+        const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
         const effectiveRole = disableRbac ? "OWNER" : (fullAccessMode ? "OWNER" : normalizeRole(decoded.role));
 
         req.user = {
@@ -142,9 +142,22 @@ const destroySession = async (token) => {
     } catch (err) { /* skip */ }
 };
 
+// Revoke all active sessions for a user (call on password change)
+const destroyAllUserSessions = async (userId, exceptToken = null) => {
+    try {
+        const { Session } = require("../models");
+        const where = { userId, isActive: true };
+        if (exceptToken) {
+            const exceptHash = hashToken(exceptToken);
+            where.tokenHash = { $ne: exceptHash };
+        }
+        await Session.update({ isActive: false }, { where });
+    } catch (err) { /* skip */ }
+};
+
 // Verify token without middleware
 const verifyToken = (token) => {
     return jwt.verify(token, JWT_SECRET);
 };
 
-module.exports = { authenticate, generateToken, verifyToken, hashToken, createSession, getActiveSessions, destroySession };
+module.exports = { authenticate, generateToken, verifyToken, hashToken, createSession, getActiveSessions, destroySession, destroyAllUserSessions };

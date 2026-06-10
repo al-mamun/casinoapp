@@ -109,11 +109,28 @@ function canUseMongoQuery(where = {}) {
     });
 }
 
+// Returns true for field names that store integer IDs (id, userId, matchId, etc.)
+function isIdLikeField(fieldName) {
+    return fieldName === "id" || /Id$|_id$/.test(fieldName);
+}
+
+// Expand a single ID value to include both its number and string forms so that
+// MongoDB documents seeded with string IDs ("1") and those with number IDs (1)
+// are both found by the same query.
+function idFilter(value) {
+    const num = normalizeId(value);
+    if (typeof num === "number" && Number.isInteger(num)) {
+        return { $in: [num, String(num)] };
+    }
+    return num;
+}
+
 function toMongoQuery(where = {}) {
     const query = {};
     for (const [key, expected] of Object.entries(where || {})) {
         if (expected instanceof Date || expected === null || !expected || typeof expected !== "object" || Array.isArray(expected)) {
-            query[key] = normalizeId(expected);
+            // For ID-like fields, match both numeric and string-stored values
+            query[key] = isIdLikeField(key) ? idFilter(expected) : normalizeId(expected);
             continue;
         }
         const mongoOps = {};
@@ -122,7 +139,9 @@ function toMongoQuery(where = {}) {
             ...Object.getOwnPropertySymbols(expected).map((s) => [s, expected[s]])
         ]) {
             const op = getOperatorName(nestedKey) || nestedKey;
-            if (op === "in") mongoOps.$in = value.map(normalizeId);
+            // Do NOT call normalizeId on $in values — callers may intentionally pass both
+            // string and number forms; normalizeId would collapse them to the same type.
+            if (op === "in") mongoOps.$in = value;
             if (op === "ne") mongoOps.$ne = normalizeId(value);
             if (op === "gte") mongoOps.$gte = value;
             if (op === "gt") mongoOps.$gt = value;
@@ -211,7 +230,30 @@ class MongoRecord {
         const now = new Date();
         if (this._model.timestamps) this.updatedAt = now;
         const data = this.toJSON();
-        await this._model.collection().then((collection) => collection.updateOne({ id: this.id }, { $set: data }, { upsert: true }));
+
+        // Build the lookup filter. Priority order:
+        //   1. Integer adapter id  → { id: { $in: [num, "num"] } }  (handles string/number mismatch)
+        //   2. MongoDB native _id  → { _id: this._id }               (always present on fetched docs)
+        //   3. No identifier       → log error and skip (never upsert with unknown key)
+        let filter;
+        const idNum = normalizeId(this.id);
+        if (typeof idNum === "number" && Number.isInteger(idNum)) {
+            filter = { id: { $in: [idNum, String(idNum)] } };
+        } else if (this._id) {
+            // Fallback: use MongoDB's own _id — documents without an adapter 'id' field
+            // (seeded data, externally inserted) can still be updated safely this way.
+            filter = { _id: this._id };
+        } else {
+            // No usable key — refuse to upsert a ghost document.
+            console.error(`[MongoRecord.save] Skipped: no 'id' or '_id' on ${this._model.name} record`);
+            return this;
+        }
+
+        // No upsert — save() only updates existing documents.
+        // Creating new documents must go through model.create() so they get a proper id.
+        await this._model.collection().then((collection) =>
+            collection.updateOne(filter, { $set: data })
+        );
         return this;
     }
 
@@ -380,7 +422,13 @@ class MongoModel {
     async destroy(options = {}) {
         const rows = await this.findAll(options);
         const collection = await this.collection();
-        for (const row of rows) await collection.deleteOne({ id: row.id });
+        for (const row of rows) {
+            const idNum = normalizeId(row.id);
+            const filter = (typeof idNum === "number" && Number.isInteger(idNum))
+                ? { id: { $in: [idNum, String(idNum)] } }
+                : { id: idNum };
+            await collection.deleteOne(filter);
+        }
         return rows.length;
     }
 
@@ -431,6 +479,7 @@ module.exports = {
         return models.get(name);
     },
     models,
+    nextId,
     close() {
         return client ? client.close() : Promise.resolve();
     }

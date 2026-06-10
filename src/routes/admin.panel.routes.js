@@ -63,9 +63,19 @@ router.post("/deposit", verifyToken, allowRoles("OWNER", "ADMIN"), async (req, r
     const { userId, amount } = req.body;
 
     const wallet = await Wallet.findOne({ where: { userId } });
+    if (!wallet) return res.status(404).json({ success: false, message: "Wallet not found" });
 
-    wallet.balance += Number(amount);
-    await wallet.save();
+    const newBalance = Number((Number(wallet.balance || 0) + Number(amount)).toFixed(2));
+    try {
+        const wc = await Wallet.collection();
+        await wc.updateMany(
+            { userId: { $in: [Number(userId), String(userId)] } },
+            { $set: { balance: newBalance, updatedAt: new Date() } }
+        );
+    } catch {
+        wallet.balance = newBalance;
+        await wallet.save();
+    }
 
     res.json({ success: true, message: "Balance updated" });
 });

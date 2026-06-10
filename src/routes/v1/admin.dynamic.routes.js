@@ -24,7 +24,9 @@ const {
 function parseListQuery(req) {
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-    const sortBy = String(req.query.sortBy || "createdAt");
+    const ALLOWED_SORT_FIELDS = ["id", "createdAt", "updatedAt", "username", "fullName", "email", "balance", "status", "amount", "type"];
+    const rawSortBy = String(req.query.sortBy || "createdAt");
+    const sortBy = ALLOWED_SORT_FIELDS.includes(rawSortBy) ? rawSortBy : "createdAt";
     const sortOrder = String(req.query.sortOrder || "DESC").toUpperCase() === "ASC" ? "ASC" : "DESC";
     const search = String(req.query.search || "").trim();
     return { page, limit, offset: (page - 1) * limit, sortBy, sortOrder, search };

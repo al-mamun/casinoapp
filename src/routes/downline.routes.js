@@ -32,12 +32,21 @@ router.get("/", verifyToken, allowRoles("OWNER", "ADMIN", "MASTER", "AGENT"),
 //     });
 
 router.post("/deposit", async (req, res) => {
-
     const { userId, amount } = req.body;
-
     const wallet = await Wallet.findOne({ where: { userId } });
-    wallet.balance += Number(amount);
-    await wallet.save();
+    if (!wallet) return res.status(404).json({ error: "Wallet not found" });
+
+    const newBalance = Number((Number(wallet.balance || 0) + Number(amount)).toFixed(2));
+    try {
+        const wc = await Wallet.collection();
+        await wc.updateMany(
+            { userId: { $in: [Number(userId), String(userId)] } },
+            { $set: { balance: newBalance, updatedAt: new Date() } }
+        );
+    } catch {
+        wallet.balance = newBalance;
+        await wallet.save();
+    }
 
     await Transaction.create({
         userId,
@@ -48,17 +57,26 @@ router.post("/deposit", async (req, res) => {
 
     res.json({ success: true });
 });
+
 router.post("/withdraw", async (req, res) => {
-
     const { amount } = req.body;
-
     const wallet = await Wallet.findOne({ where: { userId: req.user.id } });
+    if (!wallet) return res.status(404).json({ error: "Wallet not found" });
 
-    if (wallet.balance < amount)
+    if (Number(wallet.balance || 0) < Number(amount))
         return res.status(400).json({ error: "Insufficient balance" });
 
-    wallet.balance -= amount;
-    await wallet.save();
+    const newBalance = Number((Number(wallet.balance || 0) - Number(amount)).toFixed(2));
+    try {
+        const wc = await Wallet.collection();
+        await wc.updateMany(
+            { userId: { $in: [Number(req.user.id), String(req.user.id)] } },
+            { $set: { balance: newBalance, updatedAt: new Date() } }
+        );
+    } catch {
+        wallet.balance = newBalance;
+        await wallet.save();
+    }
 
     await Transaction.create({
         userId: req.user.id,

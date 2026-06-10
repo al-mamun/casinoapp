@@ -63,7 +63,8 @@ router.get("/hyper", authenticate, asyncHandler(async (req, res) => {
 router.patch("/hyper/:id", authenticate, authorize('MESSAGE:EDIT'), asyncHandler(async (req, res) => {
     const msg = await Message.findByPk(req.params.id);
     if (!msg) return error(res, "Message not found", 404);
-    await msg.update(req.body);
+    const { title, content, isActive } = req.body;
+    await msg.update({ title, content, isActive });
     return success(res, msg, "Message updated");
 }));
 
@@ -89,7 +90,8 @@ router.get("/important", authenticate, asyncHandler(async (req, res) => {
 router.patch("/important/:id", authenticate, authorize('MESSAGE:EDIT'), asyncHandler(async (req, res) => {
     const msg = await Message.findByPk(req.params.id);
     if (!msg) return error(res, "Message not found", 404);
-    await msg.update(req.body);
+    const { title, content, isActive } = req.body;
+    await msg.update({ title, content, isActive });
     return success(res, msg, "Message updated");
 }));
 

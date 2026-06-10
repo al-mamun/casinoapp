@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const bcrypt = require("bcryptjs");
 const { User, Wallet, Role } = require("../../models");
-const { authenticate, generateToken, createSession, getActiveSessions, destroySession } = require("../../middleware/auth.middleware");
+const { authenticate, generateToken, createSession, getActiveSessions, destroySession, destroyAllUserSessions } = require("../../middleware/auth.middleware");
 const { asyncHandler } = require("../../middleware/errorHandler");
 const { validate, loginSchema, changePasswordSchema } = require("../../utils/validation");
 const { success, error } = require("../../utils/apiResponse");
@@ -43,11 +43,13 @@ router.post("/login", validate(loginSchema), asyncHandler(async (req, res) => {
         }
     }
 
-    if (!user) return error(res, "User not found", 404, "NOT_FOUND");
-    if (!user.isActive) return error(res, "Account is inactive", 403, "ACCOUNT_INACTIVE");
+    // Use a generic message for all auth failures — don't reveal whether username/password is wrong
+    const INVALID_CREDENTIALS_MSG = "Invalid username or password";
+    if (!user) return error(res, INVALID_CREDENTIALS_MSG, 401, "INVALID_CREDENTIALS");
+    if (!user.isActive) return error(res, INVALID_CREDENTIALS_MSG, 401, "INVALID_CREDENTIALS");
 
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return error(res, "Wrong password", 401, "WRONG_PASSWORD");
+    if (!match) return error(res, INVALID_CREDENTIALS_MSG, 401, "INVALID_CREDENTIALS");
 
     const token = generateToken(user);
 
@@ -115,6 +117,9 @@ router.patch("/change-password", authenticate, validate(changePasswordSchema), a
 
     user.password = await bcrypt.hash(newPassword, 10);
     await user.save();
+
+    // Revoke all OTHER sessions — the current session stays valid
+    await destroyAllUserSessions(user.id, req.token);
 
     await AuditLog.create({
         userId: user.id,

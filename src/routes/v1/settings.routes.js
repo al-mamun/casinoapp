@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const crypto = require("crypto");
+const { JWT_SECRET: _JWT_SECRET } = require("../../config");
 const { SystemSettings } = require("../../models");
 const { authenticate } = require("../../middleware/auth.middleware");
 const { authorize } = require("../../middleware/authorize");
@@ -27,7 +28,7 @@ async function setSetting(key, value, category, userId) {
     return setting;
 }
 
-const SECRET = crypto.createHash("sha256").update(process.env.JWT_SECRET || "SUPER_SECRET_KEY_123").digest();
+const SECRET = crypto.createHash("sha256").update(_JWT_SECRET).digest();
 function encryptSecret(value = "") {
     if (!value) return "";
     const iv = crypto.randomBytes(12);

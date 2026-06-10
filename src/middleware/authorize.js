@@ -13,8 +13,8 @@ const authorize = (permission) => {
             });
         }
 
-        // Dev bypass: disable RBAC for authenticated users unless explicitly turned off.
-        const disableRbac = String(process.env.DISABLE_RBAC || (process.env.NODE_ENV !== "production" ? "true" : "false")).toLowerCase() === "true";
+        // RBAC is enabled by default. Set DISABLE_RBAC=true only for local debugging.
+        const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
         if (disableRbac) {
             return next();
         }

@@ -150,7 +150,8 @@ router.post("/whitelabels", authenticate, authorize('WHITELABEL:CREATE'), asyncH
         return error(res, `White-label limit reached (${limitSetting}). Increase limit first.`, 400, "WHITELABEL_LIMIT");
     }
 
-    const label = await WhiteLabel.create({ ...req.body, ownerId: req.user.id });
+    const { name, domain, logo, primaryColor, secondaryColor, isActive, currencyCode, commissionRate } = req.body;
+    const label = await WhiteLabel.create({ name, domain, logo, primaryColor, secondaryColor, isActive, currencyCode, commissionRate, ownerId: req.user.id });
 
     const AuditLog = require("../../core/audit.engine");
     await AuditLog.create({
@@ -167,7 +168,8 @@ router.post("/whitelabels", authenticate, authorize('WHITELABEL:CREATE'), asyncH
 router.patch("/whitelabels/:id", authenticate, authorize('WHITELABEL:EDIT'), asyncHandler(async (req, res) => {
     const label = await WhiteLabel.findByPk(req.params.id);
     if (!label) return error(res, "White label not found", 404);
-    await label.update(req.body);
+    const { name, domain, logo, primaryColor, secondaryColor, isActive, currencyCode, commissionRate } = req.body;
+    await label.update({ name, domain, logo, primaryColor, secondaryColor, isActive, currencyCode, commissionRate });
     return success(res, label, "White label updated");
 }));
 

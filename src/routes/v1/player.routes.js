@@ -1,10 +1,23 @@
 const router = require("express").Router();
+
+// ── In-memory wallet cache to make game-callback respond in < 200ms ──────────
+// Keyed by userId (string). Evicted after 60 seconds.
+const _walletCache = new Map(); // userId → {balance, expiresAt}
+function cacheWallet(userId, balance) {
+    _walletCache.set(String(userId), { balance: Number(balance), expiresAt: Date.now() + 60000 });
+}
+function getCachedBalance(userId) {
+    const entry = _walletCache.get(String(userId));
+    if (!entry || Date.now() > entry.expiresAt) return null;
+    return entry.balance;
+}
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 const { Op, literal, Transaction: SequelizeTransaction } = require("sequelize");
 const { success, error } = require("../../utils/apiResponse");
 const { SystemSettings, User, Wallet, Transaction, Session } = require("../../models");
 const { authenticate, generateToken, createSession } = require("../../middleware/auth.middleware");
+const { authorize } = require("../../middleware/authorize");
 
 async function getWebsiteSetting(key) {
     try {
@@ -85,7 +98,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = cacheMs("PROVIDER
     }
 }
 
-const SECRET = crypto.createHash("sha256").update(process.env.JWT_SECRET || "SUPER_SECRET_KEY_123").digest();
+const { JWT_SECRET: _JWT_SECRET } = require("../../config");
+const SECRET = crypto.createHash("sha256").update(_JWT_SECRET).digest();
 const DEFAULT_HIGHAPI_CALLBACK_URL = "https://betx365-backend-kappa.vercel.app/api/v1/player/game-callback";
 function decryptSecret(value = "") {
     if (!value || !String(value).includes(":")) return value || "";
@@ -299,11 +313,24 @@ function withProviderQuery(url, params = {}) {
     return next.toString();
 }
 
+const LOCALHOST_RE = /localhost|127\.0\.0\.1|\/ui\/player|index\.html/i;
+
 function safeProviderCallbackUrl(value, host) {
+    // Priority 1: GAME_CALLBACK_URL env var (tunnel URL for local dev)
+    const envOverride = String(process.env.GAME_CALLBACK_URL || "").trim();
+    if (envOverride && !LOCALHOST_RE.test(envOverride)) return envOverride;
+
+    // Priority 2: configured callbackUrl (from DB settings or HIGHAPI_CALLBACK_URL env)
     const url = String(value || "").trim();
-    if (!url) return DEFAULT_HIGHAPI_CALLBACK_URL;
-    if (/localhost|127\.0\.0\.1|\/ui\/player|index\.html/i.test(url)) return DEFAULT_HIGHAPI_CALLBACK_URL;
-    return url;
+    if (url && !LOCALHOST_RE.test(url)) return url;
+
+    // Priority 3: derive from the current server's host (works automatically when deployed)
+    if (host && !LOCALHOST_RE.test(host)) {
+        return `${host.replace(/\/$/, "")}/api/v1/player/game-callback`;
+    }
+
+    // Priority 4: hardcoded production fallback
+    return DEFAULT_HIGHAPI_CALLBACK_URL;
 }
 
 function toAmountValue(...values) {
@@ -315,7 +342,9 @@ function toAmountValue(...values) {
 }
 
 function toAmount(...values) {
-    return toAmountValue(...values) ?? 0;
+    // Returns null when no valid numeric value is found.
+    // Callers that need a 0 fallback should use: toAmount(...) ?? 0
+    return toAmountValue(...values);
 }
 
 function parseMaybeJson(value) {
@@ -604,36 +633,70 @@ async function logBalanceDebug(entry) {
 async function ensureWalletForUser(userId) {
     let wallet = await Wallet.findOne({ where: { userId } }).catch(() => null);
     if (wallet) return wallet;
-    wallet = await Wallet.create({ userId, balance: 0 }).catch(() => null);
+    // Wallet document missing — seed balance from the User record so we don't
+    // accidentally create a 0-balance wallet and wipe out a deposit.
+    let seedBalance = 0;
+    try {
+        const userRow = await User.findByPk(Number(userId));
+        seedBalance = Number(userRow?.balance || 0);
+    } catch {}
+    console.log(`[ensureWalletForUser] Creating wallet for userId=${userId} with seed balance=${seedBalance}`);
+    wallet = await Wallet.create({ userId: Number(userId), balance: seedBalance }).catch(() => null);
     return wallet;
 }
 
 async function updateWalletBalanceAtomic({ wallet, userId, delta, description, referenceId, referenceType, transactionType }) {
-    const conn = await wallet.sequelize.transaction();
+    // The MongoDB adapter does not support real Sequelize transactions or row locks.
+    // We do a read-check-write sequence with Number() casting to avoid BSON type issues.
+    const lockedWallet = await Wallet.findOne({ where: { userId } });
+    if (!lockedWallet) throw new Error("Wallet not found");
+
+    const before = Number(Number(lockedWallet.balance || 0).toFixed(2));
+    const after = Number((before + Number(delta || 0)).toFixed(2));
+
+    if (after < 0) {
+        return { ok: false, before, after: before, wallet: lockedWallet };
+    }
+
+    const uid = Number(userId);
+    const uidStr = String(userId);
+    // updateMany covers any leftover duplicate wallet documents
     try {
-        const lockedWallet = await Wallet.findOne({
-            where: { userId },
-            transaction: conn,
-            lock: SequelizeTransaction.LOCK.UPDATE
-        });
-        if (!lockedWallet) {
-            throw new Error("Wallet not found");
+        const walletCollection = await Wallet.collection();
+        await walletCollection.updateMany(
+            { userId: { $in: [uid, uidStr] } },
+            { $set: { balance: after, updatedAt: new Date() } }
+        );
+    } catch {
+        if (lockedWallet._id) {
+            try {
+                const walletCollection = await Wallet.collection();
+                await walletCollection.updateOne({ _id: lockedWallet._id }, { $set: { balance: after, updatedAt: new Date() } });
+            } catch {
+                lockedWallet.balance = after;
+                await lockedWallet.save();
+            }
+        } else {
+            lockedWallet.balance = after;
+            await lockedWallet.save();
         }
-        const before = Number(lockedWallet.balance || 0);
-        const after = Number((before + Number(delta || 0)).toFixed(2));
-        if (after < 0) {
-            await conn.rollback();
-            return { ok: false, before, after: before, wallet: lockedWallet };
-        }
+    }
+    // Sync User.balance (hook not supported by MongoDB adapter)
+    try {
+        const { User } = require("../../models");
+        const userCollection = await User.collection();
+        await userCollection.updateMany(
+            { id: { $in: [uid, uidStr] } },
+            { $set: { balance: after, updatedAt: new Date() } }
+        );
+    } catch {}
+    lockedWallet.balance = after;
 
-        lockedWallet.balance = after;
-        await lockedWallet.save({ transaction: conn });
-
-        const [transactionRow, created] = await Transaction.findOrCreate({
-            where: {
-                userId,
-                referenceId: referenceId || null
-            },
+    // Upsert the ledger entry
+    let transactionRow;
+    try {
+        const [row, created] = await Transaction.findOrCreate({
+            where: { userId, referenceId: referenceId || null },
             defaults: {
                 userId,
                 type: transactionType || "GAME_SETTLEMENT",
@@ -644,27 +707,24 @@ async function updateWalletBalanceAtomic({ wallet, userId, delta, description, r
                 description: description || "",
                 referenceId: referenceId || null,
                 referenceType: referenceType || "GAME_CALLBACK"
-            },
-            transaction: conn
+            }
         });
-
-        if (!created || transactionRow.balanceAfter !== after) {
-            transactionRow.amount = Math.abs(Number(delta || 0));
-            transactionRow.balanceBefore = before;
-            transactionRow.balanceAfter = after;
-            transactionRow.status = "COMPLETED";
-            transactionRow.description = description || transactionRow.description;
-            transactionRow.referenceId = referenceId || transactionRow.referenceId;
-            transactionRow.referenceType = referenceType || transactionRow.referenceType;
-            await transactionRow.save({ transaction: conn });
+        if (!created) {
+            row.amount = Math.abs(Number(delta || 0));
+            row.balanceBefore = before;
+            row.balanceAfter = after;
+            row.status = "COMPLETED";
+            if (description) row.description = description;
+            if (referenceId) row.referenceId = referenceId;
+            if (referenceType) row.referenceType = referenceType;
+            await row.save();
         }
-
-        await conn.commit();
-        return { ok: true, before, after, wallet: lockedWallet, transaction: transactionRow };
-    } catch (err) {
-        await conn.rollback();
-        throw err;
+        transactionRow = row;
+    } catch (txErr) {
+        console.error('[updateWalletBalanceAtomic] Ledger write failed:', txErr.message);
     }
+
+    return { ok: true, before, after, wallet: lockedWallet, transaction: transactionRow };
 }
 
 async function normalizeCallbackPayload(req) {
@@ -720,11 +780,17 @@ function inferCallbackAmounts(payload = {}) {
     const isRefund = /refund|cancel|rollback|void|return/i.test(action);
 
     if (!isBalance) {
-        if (isDebit && !bet && amount !== null) bet = Math.abs(amount);
-        if (isCredit && !win && amount !== null) win = Math.max(0, amount);
-        if (isCredit && !win && creditAmount !== null) win = Math.max(0, creditAmount);
-        if (isRefund && !refund && amount !== null) refund = Math.abs(amount);
-        if (!action && amount !== null && amount < 0) bet = Math.abs(amount);
+        // Only fall back to generic `amount` when the dedicated field is absent (null/undefined).
+        // IMPORTANT: use strict null checks (=== null) rather than falsy checks so that a
+        // legitimate 0 value (no win, no bet) is NOT overwritten by a balance-looking field
+        // like credit_amount that many providers set to the player's current balance.
+        if (isDebit  && bet     === null && amount       !== null) bet    = Math.abs(amount);
+        if (isCredit && win     === null && amount       !== null) win    = Math.max(0, amount);
+        // credit_amount is often the player's *current balance*, not a win amount — only use
+        // it as win if win is genuinely absent AND the amount field wasn't already used.
+        if (isCredit && win     === null && creditAmount !== null) win    = Math.max(0, creditAmount);
+        if (isRefund && refund  === null && amount       !== null) refund = Math.abs(amount);
+        if (!action  && amount  !== null && amount < 0)           bet    = Math.abs(amount);
     }
 
     let settlementType = "settle";
@@ -736,6 +802,10 @@ function inferCallbackAmounts(payload = {}) {
     else if (isDebit) settlementType = "debit";
     else if (isCredit) settlementType = "win";
 
+    // Normalize nulls to 0 for callers that expect numbers
+    bet    = bet    ?? 0;
+    win    = win    ?? 0;
+    refund = refund ?? 0;
     return { action, settlementType, bet, win, refund, amount };
 }
 
@@ -743,7 +813,9 @@ function callbackBalanceResponse(wallet, extra = {}) {
     const balance = Number(Number(wallet?.balance || 0).toFixed(2));
     return {
         success: true,
-        status: true,
+        status: 1,
+        errCode: 0,
+        error_code: 0,
         credit_amount: balance,
         balance,
         current_balance: balance,
@@ -837,42 +909,55 @@ async function applyWalletSettlement({ wallet, userId, bet = 0, win = 0, refund 
     }
     const netAmount = Number((normalizedWin + normalizedRefund - normalizedBet).toFixed(2));
 
-    if (typeof Wallet.collection === "function") {
-        const collection = await Wallet.collection();
-        const query = { userId: Number(userId) };
-        if (normalizedBet > 0) query.balance = { $gte: normalizedBet };
-        const result = await collection.findOneAndUpdate(
-            query,
-            {
-                $inc: { balance: netAmount },
-                $set: { updatedAt: new Date() }
-            },
-            { returnDocument: "after" }
+    const before = Number(Number(wallet.balance || 0).toFixed(2));
+    if (normalizedBet > before) {
+        return { ok: false, code: "INSUFFICIENT_BALANCE", before, after: before, netAmount };
+    }
+    const after = Number((before + netAmount).toFixed(2));
+
+    const uid = Number(userId);
+    const uidStr = String(userId);
+
+    // Use updateMany so ALL wallet documents for this userId are updated (handles leftover
+    // duplicates from previous ghost-upsert bug). After startup normalizer runs, there
+    // should only ever be one document per userId, but updateMany is safe either way.
+    try {
+        const walletCollection = await Wallet.collection();
+        await walletCollection.updateMany(
+            { userId: { $in: [uid, uidStr] } },
+            { $set: { balance: after, updatedAt: new Date() } }
         );
-        const updated = result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : result;
-        if (!updated) {
-            const latest = await Wallet.findOne({ where: { userId } }).catch(() => wallet);
-            return {
-                ok: false,
-                code: "INSUFFICIENT_BALANCE",
-                before: Number(latest?.balance || wallet?.balance || 0),
-                after: Number(latest?.balance || wallet?.balance || 0),
-                netAmount
-            };
+    } catch (collErr) {
+        // Fallback: use wallet's native MongoDB _id (always present on fetched docs)
+        if (wallet._id) {
+            try {
+                const walletCollection = await Wallet.collection();
+                await walletCollection.updateOne(
+                    { _id: wallet._id },
+                    { $set: { balance: after, updatedAt: new Date() } }
+                );
+            } catch {
+                wallet.balance = after;
+                await wallet.save();
+            }
+        } else {
+            wallet.balance = after;
+            await wallet.save();
         }
-        const after = Number(Number(updated.balance || 0).toFixed(2));
-        const before = Number((after - netAmount).toFixed(2));
-        Object.assign(wallet, updated?.toJSON ? updated.toJSON() : updated);
-        return { ok: true, before, after, netAmount };
     }
 
-    const before = Number(Number(wallet.balance || 0).toFixed(2));
-    if (normalizedBet > before) return { ok: false, code: "INSUFFICIENT_BALANCE", before, after: before, netAmount };
-    const after = Number((before + netAmount).toFixed(2));
+    // Keep User.balance in sync (hook doesn't fire in the MongoDB adapter)
+    try {
+        const { User } = require("../../models");
+        const userCollection = await User.collection();
+        await userCollection.updateMany(
+            { id: { $in: [uid, uidStr] } },
+            { $set: { balance: after, updatedAt: new Date() } }
+        );
+    } catch {}
+
     wallet.balance = after;
-    await wallet.save();
-    await wallet.reload().catch(() => null);
-    return { ok: true, before, after: Number(wallet.balance || after), netAmount };
+    return { ok: true, before, after, netAmount };
 }
 
 function pickProviderImage(game = {}) {
@@ -1397,9 +1482,14 @@ router.post("/game-launch", authenticate, async (req, res) => {
             });
             const host = `${req.protocol}://${req.get("host")}`;
             const callbackUrl = safeProviderCallbackUrl(apiConfig.callbackUrl, host);
+            console.log(`[game-launch] userId=${req.user.id} game=${game.gameUid || game.id} callbackUrl=${callbackUrl} walletBalance=${wallet?.balance ?? "null (wallet not found!)"} host=${host}`);
             const playerId = String(req.user.id);
             const playerName = String(req.user.username || `player${req.user.id}`);
             const providerGameUid = String(game.gameUid || game.id);
+            const walletBal = Number(wallet?.balance ?? 0);
+            console.log(`[game-launch] walletBal=${walletBal} (raw wallet.balance=${wallet?.balance})`);
+            cacheWallet(req.user.id, walletBal); // prime cache for first callback;
+            // Full payload — all variants included; balance sent as string per HighAPI docs
             const payload = {
                 player_id: playerId,
                 player_uid: playerId,
@@ -1407,8 +1497,8 @@ router.post("/game-launch", authenticate, async (req, res) => {
                 member_account: playerId,
                 username: playerName,
                 player_name: playerName,
-                balance: Number(wallet?.balance || 0),
-                credit_amount: Number(wallet?.balance || 0),
+                balance: String(walletBal),
+                credit_amount: String(walletBal),
                 game_uid: providerGameUid,
                 game_code: providerGameUid,
                 game_id: String(game.id),
@@ -1425,6 +1515,7 @@ router.post("/game-launch", authenticate, async (req, res) => {
             };
             const encrypted = encryptLaunchPayload(payload, secretKey);
             const { response, data } = await launchProviderGame(launchEndpoint, apiKey, encrypted, apiConfig, payload);
+            console.log(`[game-launch] HighAPI response status=${response.status} body=${JSON.stringify(data)}`);
             if (!response.ok) return error(res, data.message || "Provider launch failed", response.status, "GAME_PROVIDER_ERROR");
             if (providerStatusFailed(data)) return error(res, data.message || "Provider launch failed", data.code || 502, data.errorCode || "GAME_PROVIDER_ERROR");
             const launchUrl = pickFirst(
@@ -1504,13 +1595,33 @@ router.post("/game-spin", authenticate, async (req, res) => {
         // Get wallet and check balance
         let wallet = await Wallet.findOne({ where: { userId: req.user.id } });
         if (!wallet) {
-            await markGameTransactionFailed(reserved.transaction, "Wallet not found");
-            return error(res, "Wallet not found", 404);
+            // Auto-create wallet, seeding balance from User record
+            const userRow = await User.findByPk(req.user.id);
+            const seedBalance = Number(userRow?.balance || 0);
+            wallet = await Wallet.create({ userId: req.user.id, balance: seedBalance });
+        }
+
+        // Sync wallet balance from User.balance if wallet is behind.
+        // This fixes the case where deposits went to User.balance but not to Wallet.balance.
+        const userRow = await User.findByPk(req.user.id);
+        const userBalance = Number(userRow?.balance || 0);
+        const walletBalance = Number(wallet.balance || 0);
+        if (userBalance > walletBalance) {
+            try {
+                const wc = await Wallet.collection();
+                await wc.updateMany(
+                    { userId: { $in: [Number(req.user.id), String(req.user.id)] } },
+                    { $set: { balance: userBalance, updatedAt: new Date() } }
+                );
+                wallet.balance = userBalance;
+            } catch {
+                wallet.balance = userBalance;
+            }
         }
 
         if (Number(wallet.balance || 0) < normalizedStake) {
             await markGameTransactionFailed(reserved.transaction, "Insufficient balance");
-            return error(res, "Your balance is none", 402, "INSUFFICIENT_BALANCE");
+            return error(res, "Insufficient balance. Please deposit to continue.", 402, "INSUFFICIENT_BALANCE");
         }
 
         // Calculate game result
@@ -1556,6 +1667,8 @@ router.post("/game-spin", authenticate, async (req, res) => {
 });
 
 router.all("/game-callback", async (req, res) => {
+    console.log(`[game-callback RAW] method=${req.method} body=${JSON.stringify(req.body)} query=${JSON.stringify(req.query)}`);
+
     let debugEntry = null;
     let processedTransaction = null;
     let settlementTransaction = null;
@@ -1597,6 +1710,8 @@ router.all("/game-callback", async (req, res) => {
 
         const inferred = inferCallbackAmounts(payload);
         const settlementType = inferred.settlementType;
+        // Log raw payload so we can see exactly what the provider sends
+        console.log(`[game-callback RAW] settlementType=${settlementType} payload_keys=${Object.keys(payload).join(",")} inferred_bet=${inferred.bet} inferred_win=${inferred.win} inferred_refund=${inferred.refund} action=${payload.action||payload.type||payload.event||"?"} amount=${payload.amount} bet_amount=${payload.bet_amount||payload.betAmount} win_amount=${payload.win_amount||payload.winAmount} credit_amount=${payload.credit_amount||payload.creditAmount} debit_amount=${payload.debit_amount||payload.debitAmount}`);
         const gameUid = pickFirst(payload.game_uid, payload.gameUid, payload.game_id, payload.gameId, payload.game_code, payload.gameCode);
         const gameRound = pickFirst(payload.game_round, payload.gameRound, payload.round_id, payload.roundId, payload.round, payload.gameRoundId);
         const roundId = pickFirst(payload.round_id, payload.roundId, payload.round_identifier, payload.roundIdentifier);
@@ -1655,178 +1770,145 @@ router.all("/game-callback", async (req, res) => {
         }
 
         const balanceBefore = Number(wallet.balance || 0);
+        // IMPORTANT: timestamp is intentionally excluded from referenceId.
+        // HighAPI retries failed callbacks with a new timestamp each time.
+        // Including timestamp would treat every retry as a new transaction,
+        // draining the player's balance on each retry. gameRound/transactionId
+        // are stable across retries and are sufficient for dedup.
         const referenceId = stableReferenceId(
             settlementType || "settle",
             transactionId ? `tx:${transactionId}` : "",
             gameUid ? `game:${gameUid}` : "",
             gameRound ? `gameRound:${gameRound}` : "",
             roundId ? `roundId:${roundId}` : "",
-            timestamp ? `ts:${timestamp}` : "",
             `${callbackLookup}`
         );
 
         if (settlementType === "balance") {
+            // Return the player's ACTUAL current balance.
+            // Cached balance is preferred (instant); fall back to balanceBefore from the DB wallet.
+            // Returning 0 here would cause the game to display 0 after every spin.
+            const balanceVal = Number((getCachedBalance(user.id) ?? balanceBefore).toFixed(2));
             const responseBody = {
-                success: true,
-                status: true,
-                balance: balanceBefore,
-                credit_amount: balanceBefore,
-                available_balance: balanceBefore,
-                current_balance: balanceBefore,
-                username: user.username,
-                playerId: playerId || String(user.id),
-                externalId: externalId || String(user.id),
-                timestamp: Date.now()
+                status: 1,
+                errCode: 0,
+                error_code: 0,
+                credit_amount: balanceVal,
+                balance: balanceVal,
+                current_balance: balanceVal,
+                player_balance: balanceVal,
+                available_balance: balanceVal,
+                timestamp: Math.floor(Date.now() / 1000)
             };
-            await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, {
-                resolvedUserId: user.id,
-                balanceBefore,
-                balanceAfter: balanceBefore
-            });
-            return res.json(responseBody);
+            console.log(`[game-callback] balance-check response userId=${user.id} balance=${balanceVal}`);
+            res.json(responseBody);
+            appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, { resolvedUserId: user.id, balanceBefore, balanceAfter: balanceBefore }).catch(() => null);
+            return;
         }
 
         const delta = Number((win + refund - bet).toFixed(2));
-        if (delta === 0) {
-            const responseBody = {
-                success: true,
-                status: true,
-                balance: balanceBefore,
-                credit_amount: balanceBefore,
-                net_amount: 0,
-                timestamp: Date.now()
-            };
-            await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, {
-                resolvedUserId: user.id,
-                balanceBefore,
-                balanceAfter: balanceBefore
-            });
-            return res.json(responseBody);
+
+        // Use cached balance for instant response; fall back to DB if cache miss
+        let before = getCachedBalance(user.id);
+        let freshWallet = null;
+        if (before === null) {
+            freshWallet = await Wallet.findOne({ where: { userId: user.id } });
+            if (!freshWallet) throw new Error("Wallet not found for balance update");
+            before = Number(Number(freshWallet.balance || 0).toFixed(2));
+        }
+        const after = Number((before + delta).toFixed(2));
+
+        if (after < 0) {
+            const responseBody = { status: 0, errCode: 1, error_code: 1, credit_amount: before, balance: before, current_balance: before, timestamp: Math.floor(Date.now() / 1000) };
+            await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
+            return res.status(402).json(responseBody);
         }
 
+        // Update cache immediately so next callback sees the new balance
+        cacheWallet(user.id, after);
+
+        // credit_amount per HighAPI PHP docs = max(0, bet-win) — the net amount deducted from the player.
+        // balance = player's new balance as a NUMBER (not a string).
+        const creditAmount = Number(Math.max(0, bet - win).toFixed(2));
+        const responseBody = {
+            status: 1,
+            errCode: 0,
+            error_code: 0,
+            credit_amount: creditAmount,
+            balance: after,
+            current_balance: after,
+            player_balance: after,
+            available_balance: after,
+            timestamp: Math.floor(Date.now() / 1000)
+        };
+        console.log(`[game-callback] FAST response credit_amount=${creditAmount} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
+        res.json(responseBody);
+
+        // === BACKGROUND DB WRITES (fire-and-forget) ===
         const transactionType = delta >= 0 ? "BET_WON" : "GAME_SETTLEMENT";
         const description = `Game ${gameUid || ""} ${settlementType || "settle"} round ${gameRound || ""}`.trim();
+        const uid = Number(user.id);
+        const uidStr = String(user.id);
 
-        settlementTransaction = await Transaction.findOne({
-            where: {
-                userId: user.id,
-                referenceId
+        // eslint-disable-next-line no-inner-declarations
+        async function backgroundSettle() {
+            try {
+                // Idempotency check first
+                const existingTxn = await Transaction.findOne({ where: { userId: user.id, referenceId } }).catch(() => null);
+                if (existingTxn?.status === "COMPLETED") {
+                    console.log(`[game-callback BG] duplicate skipped referenceId=${referenceId}`);
+                    return;
+                }
+
+                // Write wallet balance
+                try {
+                    const walletCol = await Wallet.collection();
+                    await walletCol.updateMany(
+                        { userId: { $in: [uid, uidStr] } },
+                        { $set: { balance: after, updatedAt: new Date() } }
+                    );
+                } catch (writeErr) {
+                    const fw = freshWallet || await Wallet.findOne({ where: { userId: user.id } }).catch(() => null);
+                    if (fw?._id) {
+                        const walletCol = await Wallet.collection();
+                        await walletCol.updateOne({ _id: fw._id }, { $set: { balance: after, updatedAt: new Date() } });
+                    } else {
+                        throw writeErr;
+                    }
+                }
+
+                // Sync User.balance
+                try {
+                    const userCol = await User.collection();
+                    await userCol.updateMany({ id: { $in: [uid, uidStr] } }, { $set: { balance: after, updatedAt: new Date() } });
+                } catch {}
+
+                // Upsert ledger entry
+                try {
+                    const [row, created] = await Transaction.findOrCreate({
+                        where: { userId: user.id, referenceId },
+                        defaults: { userId: user.id, type: transactionType, amount: Math.abs(delta), balanceBefore: before, balanceAfter: after, status: "COMPLETED", description, referenceId, referenceType: "GAME_CALLBACK" }
+                    });
+                    if (!created) {
+                        row.amount = Math.abs(delta); row.balanceBefore = before; row.balanceAfter = after;
+                        row.status = "COMPLETED"; if (description) row.description = description;
+                        row.referenceType = "GAME_CALLBACK";
+                        await row.save();
+                    }
+                    processedTransaction = row;
+                } catch (txErr) {
+                    console.error("[game-callback BG] Ledger write failed:", txErr.message);
+                }
+
+                console.log(`[game-callback BG] settled userId=${user.id} before=${before} after=${after}`);
+                await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: after }).catch(() => null);
+            } catch (bgErr) {
+                console.error("[game-callback BG] Background settle failed:", bgErr.message);
             }
-        }).catch(() => null);
-
-        if (settlementTransaction && settlementTransaction.status === "COMPLETED") {
-            const responseBody = {
-                success: true,
-                status: true,
-                duplicate: true,
-                balance: Number(settlementTransaction.balanceAfter || balanceBefore),
-                credit_amount: Number(settlementTransaction.balanceAfter || balanceBefore),
-                net_amount: Number(settlementTransaction.amount || 0),
-                transaction_id: settlementTransaction.id,
-                timestamp: Date.now()
-            };
-            await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, {
-                resolvedUserId: user.id,
-                balanceBefore: Number(settlementTransaction.balanceBefore || balanceBefore),
-                balanceAfter: Number(settlementTransaction.balanceAfter || balanceBefore)
-            });
-            return res.json(responseBody);
         }
-
-        if (settlementTransaction && settlementTransaction.status === "FAILED") {
-            const reason = callbackErrorReason("Duplicate failed callback", { referenceId });
-            await appendCallbackIssue(debugEntry, { status: 409, message: reason }, { resolvedUserId: user.id });
-            return res.status(409).json({ success: false, message: reason, errorCode: "DUPLICATE_FAILED_CALLBACK" });
-        }
-
-        const conn = await wallet.sequelize.transaction();
-        try {
-            const lockedWallet = await Wallet.findOne({
-                where: { userId: user.id },
-                transaction: conn,
-                lock: conn.LOCK.UPDATE
-            });
-            if (!lockedWallet) throw new Error("Wallet not found");
-
-            const before = Number(lockedWallet.balance || 0);
-            const after = Number((before + delta).toFixed(2));
-            if (after < 0) {
-                await conn.rollback();
-                const responseBody = {
-                    success: false,
-                    message: "Your balance is none",
-                    code: "INSUFFICIENT_BALANCE",
-                    balance: before,
-                    credit_amount: before,
-                    current_balance: before,
-                    available_balance: before,
-                    timestamp: Date.now()
-                };
-                await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, {
-                    resolvedUserId: user.id,
-                    balanceBefore: before,
-                    balanceAfter: before
-                });
-                return res.status(402).json(responseBody);
-            }
-
-            lockedWallet.balance = after;
-            await lockedWallet.save({ transaction: conn });
-
-            const [trx, created] = await Transaction.findOrCreate({
-                where: { userId: user.id, referenceId, type: transactionType },
-                defaults: {
-                    userId: user.id,
-                    type: transactionType,
-                    amount: Math.abs(delta),
-                    balanceBefore: before,
-                    balanceAfter: after,
-                    status: "COMPLETED",
-                    description,
-                    referenceId,
-                    referenceType: "GAME_CALLBACK"
-                },
-                transaction: conn
-            });
-
-            if (!created) {
-                trx.amount = Math.abs(delta);
-                trx.balanceBefore = before;
-                trx.balanceAfter = after;
-                trx.status = "COMPLETED";
-                trx.description = description;
-                trx.referenceType = "GAME_CALLBACK";
-                await trx.save({ transaction: conn });
-            }
-
-            await conn.commit();
-            processedTransaction = trx;
-
-            const responseBody = {
-                success: true,
-                status: true,
-                balance: after,
-                credit_amount: after,
-                net_amount: delta,
-                bet_amount: bet,
-                win_amount: win,
-                refund_amount: refund,
-                transaction_id: trx.id,
-                username: user.username,
-                playerId: playerId || String(user.id),
-                externalId: externalId || String(user.id),
-                timestamp: Date.now()
-            };
-            await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, {
-                resolvedUserId: user.id,
-                balanceBefore: before,
-                balanceAfter: after
-            });
-            return res.json(responseBody);
-        } catch (err) {
-            await conn.rollback();
-            throw err;
-        }
+        // Await so Vercel serverless doesn't terminate before DB writes finish
+        await backgroundSettle();
+        return;
     } catch (err) {
         const reason = callbackErrorReason("Callback failed", { error: err.message });
         await appendCallbackIssue(debugEntry || buildCallbackDebugEntry(req, {}, {}), { status: 500, message: reason }, {
@@ -1839,7 +1921,20 @@ router.all("/game-callback", async (req, res) => {
 router.all("/game-return", (req, res) => {
     const fallbackUrl = process.env.FRONTEND_PLAYER_URL || process.env.FRONTEND_BASE_URL || "";
     const requestedUrl = pickFirst(req.query.return_to, req.query.redirect, req.query.url, fallbackUrl);
+
+    // Build allowed-domain whitelist from env + fallback URL
+    const allowedDomains = (process.env.GAME_RETURN_ALLOWED_DOMAINS || "").split(",").map(d => d.trim().toLowerCase()).filter(Boolean);
+    if (fallbackUrl) {
+        try { allowedDomains.push(new URL(fallbackUrl).hostname.toLowerCase()); } catch {}
+    }
+
     if (/^https?:\/\//i.test(String(requestedUrl))) {
+        let targetHost = "";
+        try { targetHost = new URL(requestedUrl).hostname.toLowerCase(); } catch {}
+        // Reject open-redirect to unknown hosts
+        if (allowedDomains.length > 0 && !allowedDomains.some(d => targetHost === d || targetHost.endsWith("." + d))) {
+            return res.status(400).json({ success: false, message: "Redirect target not allowed", errorCode: "INVALID_REDIRECT" });
+        }
         return res.redirect(302, requestedUrl);
     }
     return res.json({
@@ -1850,7 +1945,20 @@ router.all("/game-return", (req, res) => {
 });
 
 router.all("/game-balance", async (req, res) => {
+    console.log(`[game-balance RAW] method=${req.method} body=${JSON.stringify(req.body)} query=${JSON.stringify(req.query)}`);
+
     try {
+        // Validate callback secret when HIGHAPI_CALLBACK_SECRET is set
+        const expectedSecret = process.env.HIGHAPI_CALLBACK_SECRET || "";
+        if (expectedSecret) {
+            const suppliedSecret = req.headers["x-callback-secret"] || req.query.secret || "";
+            const expected = Buffer.from(String(expectedSecret));
+            const supplied = Buffer.from(String(suppliedSecret));
+            if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
+                return res.status(401).json({ success: false, message: "Invalid callback signature", errorCode: "INVALID_SIGNATURE" });
+            }
+        }
+
         const payload = await normalizeCallbackPayload(req);
         const { user, wallet, lookup, debug } = await resolveWalletContext(payload, req);
         if (!user || !wallet) {
@@ -1876,9 +1984,12 @@ router.all("/game-balance", async (req, res) => {
         }
 
         const balance = Number(wallet.balance || 0);
+        console.log(`[game-balance] userId=${user.id} username=${user.username} balance=${balance} walletId=${wallet.id} walletUserId=${wallet.userId}`);
         const responseBody = {
             success: true,
-            status: true,
+            status: 1,          // numeric 1 = success; many PHP aggregators reject boolean true
+            errCode: 0,
+            error_code: 0,
             cash: balance,
             balance,
             credit_amount: balance,
@@ -1917,20 +2028,68 @@ router.all("/game-balance", async (req, res) => {
     }
 });
 
-router.get("/game-callback-debug", authenticate, async (req, res) => {
+router.get("/game-callback-debug", authenticate, authorize("BANKING:VIEW"), async (req, res) => {
     const logs = await getSetting("game_callback_debug");
     return success(res, Array.isArray(logs) ? logs : []);
 });
 
+// Debug endpoint: shows raw MongoDB wallet + user state for the authenticated player.
+// Use this to diagnose balance discrepancies without needing direct DB access.
+router.get("/wallet-debug", authenticate, async (req, res) => {
+    try {
+        const uid = req.user.id;
+        const uidNum = Number(uid);
+        const uidStr = String(uid);
+
+        // Raw collection scan — bypasses adapter so we see the exact DB state
+        const wc = await Wallet.collection();
+        const uc = await User.collection();
+
+        const [walletDocs, userDocs] = await Promise.all([
+            wc.find({ userId: { $in: [uidNum, uidStr] } }).toArray(),
+            uc.find({ id: { $in: [uidNum, uidStr] } }).toArray()
+        ]);
+
+        // Also try adapter findOne to see what the app code sees
+        const adapterWallet = await Wallet.findOne({ where: { userId: uid } }).catch((err) => ({ _error: err.message }));
+        const adapterUser   = await User.findByPk(uid).catch((err) => ({ _error: err.message }));
+
+        return success(res, {
+            queriedUserId: uid,
+            rawWalletDocs: walletDocs.map((d) => ({ _id: String(d._id), id: d.id, userId: d.userId, balance: d.balance, updatedAt: d.updatedAt })),
+            rawUserDocs:   userDocs.map((d)   => ({ _id: String(d._id), id: d.id, username: d.username, balance: d.balance, updatedAt: d.updatedAt })),
+            adapterWallet: adapterWallet ? { id: adapterWallet.id, userId: adapterWallet.userId, balance: adapterWallet.balance } : null,
+            adapterUser:   adapterUser   ? { id: adapterUser.id,   username: adapterUser.username,   balance: adapterUser.balance   } : null
+        });
+    } catch (err) {
+        return error(res, err.message || "Debug failed", 500);
+    }
+});
+
 router.get("/wallet", authenticate, async (req, res) => {
     try {
-        const wallet = await Wallet.findOne({ where: { userId: req.user.id } });
-        if (!wallet) return error(res, "Wallet not found", 404);
+        const uid = req.user.id;
+        const [wallet, userRow] = await Promise.all([
+            Wallet.findOne({ where: { userId: uid } }),
+            User.findByPk(uid)
+        ]);
+
+        const walletBal = Number(wallet?.balance || 0);
+        const userBal   = Number(userRow?.balance || 0);
+        const balance   = Math.max(walletBal, userBal);
+
+        if (wallet && userBal > walletBal) {
+            // updateMany covers any leftover duplicate documents
+            Wallet.collection()
+                .then(wc => wc.updateMany({ userId: { $in: [Number(uid), String(uid)] } }, { $set: { balance: userBal, updatedAt: new Date() } }))
+                .catch(() => null);
+        }
+
         return success(res, {
-            balance: Number(wallet.balance || 0),
-            frozenBalance: Number(wallet.frozenBalance || 0),
-            totalDeposit: Number(wallet.totalDeposit || 0),
-            totalWithdraw: Number(wallet.totalWithdraw || 0)
+            balance,
+            frozenBalance:  Number(wallet?.frozenBalance  || 0),
+            totalDeposit:   Number(wallet?.totalDeposit   || 0),
+            totalWithdraw:  Number(wallet?.totalWithdraw  || 0)
         });
     } catch (err) {
         return error(res, err.message || "Failed to fetch wallet", 500);
@@ -1939,13 +2098,31 @@ router.get("/wallet", authenticate, async (req, res) => {
 
 router.post("/wallet", authenticate, async (req, res) => {
     try {
-        const wallet = await Wallet.findOne({ where: { userId: req.user.id } });
-        if (!wallet) return error(res, "Wallet not found", 404);
+        const uid = req.user.id;
+        const [wallet, userRow] = await Promise.all([
+            Wallet.findOne({ where: { userId: uid } }),
+            User.findByPk(uid)
+        ]);
+
+        // Use the higher of wallet.balance and user.balance as source of truth.
+        // This handles the case where deposits updated User.balance but not Wallet.balance.
+        const walletBal = Number(wallet?.balance || 0);
+        const userBal   = Number(userRow?.balance || 0);
+        const balance   = Math.max(walletBal, userBal);
+
+        // If they're out of sync, fix the wallet in the background
+        if (wallet && userBal > walletBal) {
+            // updateMany covers any leftover duplicate documents
+            Wallet.collection()
+                .then(wc => wc.updateMany({ userId: { $in: [Number(uid), String(uid)] } }, { $set: { balance: userBal, updatedAt: new Date() } }))
+                .catch(() => null);
+        }
+
         return success(res, {
-            balance: Number(wallet.balance || 0),
-            frozenBalance: Number(wallet.frozenBalance || 0),
-            totalDeposit: Number(wallet.totalDeposit || 0),
-            totalWithdraw: Number(wallet.totalWithdraw || 0)
+            balance,
+            frozenBalance:  Number(wallet?.frozenBalance  || 0),
+            totalDeposit:   Number(wallet?.totalDeposit   || 0),
+            totalWithdraw:  Number(wallet?.totalWithdraw  || 0)
         });
     } catch (err) {
         return error(res, err.message || "Failed to fetch wallet", 500);

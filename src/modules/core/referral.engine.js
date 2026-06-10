@@ -1,39 +1,54 @@
+const bcrypt = require('bcryptjs');
+const { User, Wallet } = require('../../models');
 const { canCreate } = require('./role.engine');
-const db = require('../../config/db');
 
-module.exports = {
-  canCreateUser: canCreate,
-  calculateDepositBonus: (amount, pct, to) => ({ bonus: (amount * pct) / 100, required: amount * to }),
-  referralCommission: (loss, pct) => (loss * pct) / 100,
-};
+function calculateDepositBonus(amount, pct, to) {
+    return { bonus: (amount * pct) / 100, required: amount * to };
+}
+
+function referralCommission(loss, pct) {
+    return (loss * pct) / 100;
+}
 
 async function getMyAgentInfo(playerId) {
-    const [info] = await db.execute(`
-        SELECT u.whatsapp_num, u.payment_methods 
-        FROM users u 
-        JOIN users p ON u.id = p.parent_id 
-        WHERE p.id = ?`, [playerId]);
-        
-    return info[0]; // এটি প্লেয়ারকে শো করবে
+    const player = await User.findByPk(playerId);
+    if (!player || !player.parentId) return null;
+    const agent = await User.findByPk(player.parentId, {
+        attributes: ['id', 'username', 'phone', 'email'],
+    });
+    return agent ? agent.toJSON() : null;
 }
 
 async function registerUser(username, password, refCode) {
-    // ১. রেফার কোড চেক করা (এটি বাধ্যতামূলক)
-    const [agent] = await db.execute('SELECT id FROM users WHERE username = ? AND role = "MASTER_AGENT"', [refCode]);
-    
-    if (!agent.length) {
-        throw new Error('ভ্যালিড মাস্টার এজেন্ট রেফার কোড ছাড়া একাউন্ট করা সম্ভব নয়!');
+    // Referral code is required and must map to a MASTER_AGENT username
+    const agent = await User.findOne({
+        where: { username: refCode, role: 'MASTER_AGENT', isActive: true, isDeleted: false },
+        attributes: ['id'],
+    });
+
+    if (!agent) {
+        throw new Error('ভ্যালিড মাস্টার এজেন্ট রেফার কোড ছাড়া একাউন্ট করা সম্ভব নয়!');
     }
 
-    // ২. ইউজার ক্রিয়েট করা এবং parent_id হিসেবে এজেন্টের ID বসানো
     const hashedPassword = await bcrypt.hash(password, 10);
-    const [newUser] = await db.execute(
-        'INSERT INTO users (username, password, role, parent_id) VALUES (?, ?, "PLAYER", ?)',
-        [username, hashedPassword, agent[0].id]
-    );
+    const newUser = await User.create({
+        username,
+        password: hashedPassword,
+        role: 'PLAYER',
+        parentId: agent.id,
+        referredBy: refCode,
+    });
 
-    return { success: true, message: 'একাউন্ট তৈরি হয়েছে!' };
+    // Create an empty wallet for the new player
+    await Wallet.create({ userId: newUser.id });
+
+    return { success: true, message: 'একাউন্ট তৈরি হয়েছে!', userId: newUser.id };
 }
 
-module.exports.registerUser = registerUser;
-module.exports.getMyAgentInfo = getMyAgentInfo;
+module.exports = {
+    canCreateUser: canCreate,
+    calculateDepositBonus,
+    referralCommission,
+    getMyAgentInfo,
+    registerUser,
+};

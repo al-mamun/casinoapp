@@ -589,7 +589,8 @@ router.get("/methods", authenticate, asyncHandler(async (req, res) => {
 
 // POST /api/v1/banking/methods
 router.post("/methods", authenticate, authorize('BANKING_METHOD:CREATE'), validate(bankingMethodSchema), asyncHandler(async (req, res) => {
-    const method = await BankingMethod.create({ ...req.body, createdBy: req.user.id });
+    const { name, type, accountNumber, accountName, instructions, isActive, minAmount, maxAmount, logoUrl } = req.body;
+    const method = await BankingMethod.create({ name, type, accountNumber, accountName, instructions, isActive, minAmount, maxAmount, logoUrl, createdBy: req.user.id });
     return success(res, method, "Banking method created", 201);
 }));
 
@@ -598,7 +599,8 @@ router.patch("/methods/:id", authenticate, authorize('BANKING_METHOD:EDIT'), asy
     const method = await BankingMethod.findByPk(req.params.id);
     if (!method) return error(res, "Method not found", 404);
 
-    await method.update(req.body);
+    const { name, type, accountNumber, accountName, instructions, isActive, minAmount, maxAmount, logoUrl } = req.body;
+    await method.update({ name, type, accountNumber, accountName, instructions, isActive, minAmount, maxAmount, logoUrl });
     return success(res, method, "Banking method updated");
 }));
 

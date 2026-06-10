@@ -2,7 +2,7 @@ const router = require("express").Router();
 const bcrypt = require("bcryptjs");
 const { Op } = require("sequelize");
 const { User, Wallet, Role, PlayerStats } = require("../../models");
-const { authenticate } = require("../../middleware/auth.middleware");
+const { authenticate, destroyAllUserSessions } = require("../../middleware/auth.middleware");
 const { authorize } = require("../../middleware/authorize");
 const { asyncHandler } = require("../../middleware/errorHandler");
 const { validate, validateQuery, createUserSchema, changeUserPasswordSchema, depositSchema, paginationSchema } = require("../../utils/validation");
@@ -13,7 +13,7 @@ const { getFullDownlineIds, clearCache } = require("../../services/hierarchyServ
 
 // GET /api/v1/users/downline
 router.get("/downline", authenticate, authorize('DOWNLINE:VIEW'), asyncHandler(async (req, res) => {
-    const disableRbac = String(process.env.DISABLE_RBAC || (process.env.NODE_ENV !== "production" ? "true" : "false")).toLowerCase() === "true";
+    const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 1000);
     const offset = (page - 1) * limit;
@@ -155,7 +155,7 @@ router.get("/search", authenticate, authorize('DOWNLINE:VIEW'), asyncHandler(asy
 
 // POST /api/v1/users/create
 router.post("/create", authenticate, authorize('DOWNLINE:CREATE'), validate(createUserSchema), asyncHandler(async (req, res) => {
-    const disableRbac = String(process.env.DISABLE_RBAC || (process.env.NODE_ENV !== "production" ? "true" : "false")).toLowerCase() === "true";
+    const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
     const { username, password, phone, email, fullName, commissionRate } = req.body;
     const roleToCreate = String(req.body.roleToCreate || req.body.role_to_create || "")
         .trim()
@@ -335,9 +335,20 @@ router.patch("/:id/kyc", authenticate, authorize('USER:KYC_APPROVE_DOWNLINE'), a
     }, "KYC updated");
 }));
 
-// GET /api/v1/users/:id
+// GET /api/v1/users/:id — own profile (any authenticated user) or admin lookup
 router.get("/:id", authenticate, asyncHandler(async (req, res) => {
-    const user = await User.findByPk(req.params.id, {
+    const targetId = Number(req.params.id);
+    const requesterId = Number(req.user.id);
+    const isSelf = targetId === requesterId;
+    const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
+    const isAdmin = disableRbac || ["OWNER","MOTHER_PANEL","WHITE_LABEL","SUPER_ADMIN","ADMIN"].includes(req.user.actualRole || req.user.role);
+
+    // Non-admin users may only view their own profile
+    if (!isSelf && !isAdmin) {
+        return res.status(403).json({ success: false, message: "Permission denied", errorCode: "PERMISSION_DENIED" });
+    }
+
+    const user = await User.findByPk(targetId, {
         attributes: { exclude: ['password'] },
         include: [{ model: Wallet, as: 'wallet' }]
     });
@@ -462,6 +473,9 @@ router.post("/:id/change-password", authenticate, authorize('DOWNLINE:EDIT'), va
 
     user.password = await bcrypt.hash(newPassword, 10);
     await user.save();
+
+    // Revoke ALL sessions for the target user (admin override — no exceptions)
+    await destroyAllUserSessions(user.id);
 
     await AuditLog.create({
         userId: req.user.id, action: "PASSWORD_CHANGED",

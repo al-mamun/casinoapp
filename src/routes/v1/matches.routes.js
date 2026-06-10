@@ -31,7 +31,8 @@ router.get("/", authenticate, asyncHandler(async (req, res) => {
 
 // POST /api/v1/matches — create match
 router.post("/", authenticate, authorize('MATCH:CREATE'), validate(createMatchSchema), asyncHandler(async (req, res) => {
-    const match = await Match.create({ ...req.body, isManual: true });
+    const { teamA, teamB, leagueId, startTime, status, sport, venue } = req.body;
+    const match = await Match.create({ teamA, teamB, leagueId, startTime, status, sport, venue, isManual: true });
 
     await AuditLog.create({
         userId: req.user.id, action: "MATCH_CREATED",
@@ -47,7 +48,8 @@ router.patch("/:id", authenticate, authorize('MATCH:EDIT'), asyncHandler(async (
     const match = await Match.findByPk(req.params.id);
     if (!match) return error(res, "Match not found", 404);
 
-    await match.update(req.body);
+    const { teamA, teamB, leagueId, startTime, status, sport, venue } = req.body;
+    await match.update({ teamA, teamB, leagueId, startTime, status, sport, venue });
     return success(res, match, "Match updated");
 }));
 
@@ -158,7 +160,8 @@ router.get("/leagues", authenticate, asyncHandler(async (req, res) => {
 
 // POST /api/v1/matches/leagues
 router.post("/leagues", authenticate, authorize('MATCH:CREATE'), asyncHandler(async (req, res) => {
-    const league = await League.create(req.body);
+    const { name, country, sport, logoUrl } = req.body;
+    const league = await League.create({ name, country, sport, logoUrl });
     return success(res, league, "League created", 201);
 }));
 
