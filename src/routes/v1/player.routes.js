@@ -2050,17 +2050,26 @@ router.get("/game-callback-debug", authenticate, authorize("BANKING:VIEW"), asyn
 
 // Temporary diagnostic endpoint — no auth, shows callback receipt status only
 router.get("/callback-status", async (req, res) => {
-    const logs = await getSetting("game_callback_debug").catch(() => []);
-    const arr  = Array.isArray(logs) ? logs : [];
-    const last = arr[0] || null;
-    res.json({
-        callbacksLogged: arr.length,
-        lastCallbackAt:  last?.at || null,
-        lastSettlementType: last?.parsed?.settlementType || null,
-        lastUserId:      last?.parsed?.callbackUserRef  || null,
-        lastResponse:    last?.response                 || null,
-        serverTime:      new Date().toISOString()
-    });
+    try {
+        let arr = [];
+        try {
+            const raw = await getSetting("game_callback_debug");
+            if (Array.isArray(raw)) arr = raw;
+        } catch {}
+        const last = arr[0] || null;
+        return res.json({
+            ok: true,
+            callbacksLogged: arr.length,
+            lastCallbackAt:  last?.at || null,
+            lastSettlementType: last?.parsed?.settlementType || null,
+            lastUserId:      last?.parsed?.callbackUserRef  || null,
+            lastStatus:      last?.response?.status         || null,
+            lastBalance:     last?.response?.body?.balance  ?? null,
+            serverTime:      new Date().toISOString()
+        });
+    } catch (err) {
+        return res.json({ ok: false, error: err.message, serverTime: new Date().toISOString() });
+    }
 });
 
 // Debug endpoint: shows raw MongoDB wallet + user state for the authenticated player.
