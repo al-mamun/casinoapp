@@ -2048,7 +2048,7 @@ router.get("/game-callback-debug", authenticate, authorize("BANKING:VIEW"), asyn
     return success(res, Array.isArray(logs) ? logs : []);
 });
 
-// Temporary diagnostic endpoint — no auth, shows callback receipt status only
+// Temporary diagnostic endpoint — no auth
 router.get("/callback-status", async (req, res) => {
     try {
         let arr = [];
@@ -2056,17 +2056,19 @@ router.get("/callback-status", async (req, res) => {
             const raw = await getSetting("game_callback_debug");
             if (Array.isArray(raw)) arr = raw;
         } catch {}
-        const last = arr[0] || null;
-        return res.json({
-            ok: true,
-            callbacksLogged: arr.length,
-            lastCallbackAt:  last?.at || null,
-            lastSettlementType: last?.parsed?.settlementType || null,
-            lastUserId:      last?.parsed?.callbackUserRef  || null,
-            lastStatus:      last?.response?.status         || null,
-            lastBalance:     last?.response?.body?.balance  ?? null,
-            serverTime:      new Date().toISOString()
-        });
+        const recent = arr.slice(0, 10).map(e => ({
+            at:             e?.at,
+            settlementType: e?.parsed?.settlementType,
+            userId:         e?.parsed?.callbackUserRef,
+            bet:            e?.parsed?.bet,
+            win:            e?.parsed?.win,
+            status:         e?.response?.status,
+            balance:        e?.response?.body?.balance ?? null,
+            credit_amount:  e?.response?.body?.credit_amount ?? null,
+            action:         e?.payload?.action || e?.payload?.type || null,
+            rawKeys:        e?.payload ? Object.keys(e.payload).join(",") : null
+        }));
+        return res.json({ ok: true, total: arr.length, recent, serverTime: new Date().toISOString() });
     } catch (err) {
         return res.json({ ok: false, error: err.message, serverTime: new Date().toISOString() });
     }
