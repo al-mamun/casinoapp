@@ -1,5 +1,12 @@
 require('dotenv').config();
 
+// SECURITY: DISABLE_RBAC is a local-debugging flag only. Never allow it in production/Vercel.
+if (String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true"
+    && (process.env.NODE_ENV === "production" || process.env.VERCEL)) {
+    console.warn('[SECURITY] DISABLE_RBAC=true ignored in production — RBAC stays enabled.');
+    process.env.DISABLE_RBAC = "false";
+}
+
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -256,8 +263,10 @@ async function normalizeWalletBalances() {
             }
 
             const walletBalance = Number(walletDoc.balance || 0);
-            // Log current state for all users so admin can see the picture
-            console.log(`[startup] wallet userId=${uid} (${user.username || "?"}) walletBalance=${walletBalance} userBalance=${userBalance} walletId=${walletDoc.id ?? "none"}`);
+            // Per-user balance details only in non-production (avoid leaking balances to logs)
+            if (process.env.NODE_ENV !== "production") {
+                console.log(`[startup] wallet userId=${uid} (${user.username || "?"}) walletBalance=${walletBalance} userBalance=${userBalance} walletId=${walletDoc.id ?? "none"}`);
+            }
 
             const needsSync = typeof walletDoc.balance !== "number"
                 || isNaN(walletBalance)

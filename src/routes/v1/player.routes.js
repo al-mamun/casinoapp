@@ -422,6 +422,8 @@ function normalizeCallbackRef(value = "") {
 function buildCallbackDebugEntry(req, payload, parsed = {}) {
     return {
         at: new Date().toISOString(),
+        method: req.method,
+        url: req.originalUrl,
         headers: {
             contentType: req.headers["content-type"] || "",
             userAgent: req.headers["user-agent"] || "",
@@ -1807,6 +1809,8 @@ router.all("/game-callback", async (req, res) => {
             const balanceVal = Number((getCachedBalance(user.id) ?? balanceBefore).toFixed(2));
             const responseBody = {
                 status: 1,
+                code: 0,
+                msg: "",
                 errCode: 0,
                 error_code: 0,
                 credit_amount: balanceVal,
@@ -1814,7 +1818,7 @@ router.all("/game-callback", async (req, res) => {
                 current_balance: balanceVal,
                 player_balance: balanceVal,
                 available_balance: balanceVal,
-                timestamp: Math.floor(Date.now() / 1000)
+                timestamp: Date.now()
             };
             console.log(`[game-callback] balance-check response userId=${user.id} balance=${balanceVal}`);
             res.json(responseBody);
@@ -1835,7 +1839,7 @@ router.all("/game-callback", async (req, res) => {
         const after = Number((before + delta).toFixed(2));
 
         if (after < 0) {
-            const responseBody = { status: 0, errCode: 1, error_code: 1, credit_amount: before, balance: before, current_balance: before, timestamp: Math.floor(Date.now() / 1000) };
+            const responseBody = { status: 0, code: 1, msg: "Insufficient balance", errCode: 1, error_code: 1, credit_amount: before, balance: before, current_balance: before, timestamp: Date.now() };
             await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
             return res.status(402).json(responseBody);
         }
@@ -1847,6 +1851,8 @@ router.all("/game-callback", async (req, res) => {
         // (NOT the net deduction — that interpretation caused balance to show 0 whenever win >= bet.)
         const responseBody = {
             status: 1,
+            code: 0,
+            msg: "",
             errCode: 0,
             error_code: 0,
             credit_amount: after,
@@ -1854,7 +1860,7 @@ router.all("/game-callback", async (req, res) => {
             current_balance: after,
             player_balance: after,
             available_balance: after,
-            timestamp: Math.floor(Date.now() / 1000)
+            timestamp: Date.now()
         };
         console.log(`[game-callback] FAST response credit_amount=${after} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
         res.json(responseBody);
@@ -2056,7 +2062,19 @@ router.get("/callback-status", async (req, res) => {
             const raw = await getSetting("game_callback_debug");
             if (Array.isArray(raw)) arr = raw;
         } catch {}
-        const recent = arr.slice(0, 10).map(e => ({
+        // Full detail requires a debug key (sha256 of JWT_SECRET, first 16 hex chars)
+        const expectedKey = crypto.createHash("sha256").update(String(process.env.JWT_SECRET || "")).digest("hex").slice(0, 16);
+        const full = String(req.query.full || "") === "1" && String(req.query.key || "") === expectedKey;
+        const recent = arr.slice(0, full ? 15 : 10).map(e => full ? {
+            at:          e?.at,
+            method:      e?.method || null,
+            contentType: e?.headers?.contentType || null,
+            userAgent:   e?.headers?.userAgent || null,
+            body:        typeof e?.body === "string" ? e.body.slice(0, 1500) : e?.body,
+            payloadKeys: e?.payload ? Object.keys(e.payload).join(",") : null,
+            parsed:      e?.parsed,
+            response:    e?.response
+        } : {
             at:             e?.at,
             settlementType: e?.parsed?.settlementType,
             userId:         e?.parsed?.callbackUserRef,
@@ -2067,8 +2085,8 @@ router.get("/callback-status", async (req, res) => {
             credit_amount:  e?.response?.body?.credit_amount ?? null,
             action:         e?.payload?.action || e?.payload?.type || null,
             rawKeys:        e?.payload ? Object.keys(e.payload).join(",") : null
-        }));
-        return res.json({ ok: true, total: arr.length, recent, serverTime: new Date().toISOString() });
+        });
+        return res.json({ ok: true, total: arr.length, full, recent, serverTime: new Date().toISOString() });
     } catch (err) {
         return res.json({ ok: false, error: err.message, serverTime: new Date().toISOString() });
     }
