@@ -826,6 +826,7 @@ function callbackBalanceResponse(wallet, extra = {}) {
         user_balance: balance,
         amount: balance,
         timestamp: Date.now(),
+        payload: { credit_amount: balance.toFixed(2), timestamp: String(Date.now()) },
         ...extra
     };
 }
@@ -1818,7 +1819,12 @@ router.all("/game-callback", async (req, res) => {
                 current_balance: balanceVal,
                 player_balance: balanceVal,
                 available_balance: balanceVal,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                // JILI/HighAPI seamless spec: provider reads payload.credit_amount (balance after txn)
+                payload: {
+                    credit_amount: balanceVal.toFixed(2),
+                    timestamp: String(Date.now())
+                }
             };
             console.log(`[game-callback] balance-check response userId=${user.id} balance=${balanceVal}`);
             res.json(responseBody);
@@ -1839,7 +1845,11 @@ router.all("/game-callback", async (req, res) => {
         const after = Number((before + delta).toFixed(2));
 
         if (after < 0) {
-            const responseBody = { status: 0, code: 1, msg: "Insufficient balance", errCode: 1, error_code: 1, credit_amount: before, balance: before, current_balance: before, timestamp: Date.now() };
+            const responseBody = {
+                status: 0, code: 1, msg: "Insufficient balance", errCode: 1, error_code: 1,
+                credit_amount: before, balance: before, current_balance: before, timestamp: Date.now(),
+                payload: { credit_amount: before.toFixed(2), timestamp: String(Date.now()) }
+            };
             await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
             return res.status(402).json(responseBody);
         }
@@ -1860,7 +1870,12 @@ router.all("/game-callback", async (req, res) => {
             current_balance: after,
             player_balance: after,
             available_balance: after,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            // JILI/HighAPI seamless spec: provider reads payload.credit_amount (balance after txn)
+            payload: {
+                credit_amount: after.toFixed(2),
+                timestamp: String(Date.now())
+            }
         };
         console.log(`[game-callback] FAST response credit_amount=${after} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
         res.json(responseBody);
