@@ -1,22 +1,10 @@
 {
   "development": {
-    "username": "dbpbf34975162",
-    "password": "s1VX1@n+rRa0m5kllYQvFZ02",
-    "database": "samir_hosen",
-    "host": "serverless-northeurope.sysp0000.db3.skysql.com",
-    "port": 4026,
-    "dialect": "mysql",
-    "dialectOptions": {
-      "ssl": {
-        "rejectUnauthorized": false
-      }
-    },
-    "pool": {
-      "max": 5,
-      "min": 0,
-      "acquire": 30000,
-      "idle": 10000
-    }
+    "username": "root",
+    "password": null,
+    "database": "database_development",
+    "host": "127.0.0.1",
+    "dialect": "mysql"
   },
   "test": {
     "username": "root",
