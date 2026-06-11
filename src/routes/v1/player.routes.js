@@ -1845,11 +1845,8 @@ router.all("/game-callback", async (req, res) => {
         const after = Number((before + delta).toFixed(2));
 
         if (after < 0) {
-            const responseBody = {
-                status: 0, code: 1, msg: "Insufficient balance", errCode: 1, error_code: 1,
-                credit_amount: before, balance: before, current_balance: before, timestamp: Date.now(),
-                payload: { credit_amount: before.toFixed(2), timestamp: String(Date.now()) }
-            };
+            // Insufficient balance: per HighAPI doc shape, respond credit_amount=0 (nothing deducted)
+            const responseBody = { credit_amount: 0, timestamp: Date.now() };
             await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
             return res.status(402).json(responseBody);
         }
@@ -1857,27 +1854,16 @@ router.all("/game-callback", async (req, res) => {
         // Update cache immediately so next callback sees the new balance
         cacheWallet(user.id, after);
 
-        // credit_amount in HighAPI seamless-wallet settle response = player's CURRENT balance after the transaction.
-        // (NOT the net deduction — that interpretation caused balance to show 0 whenever win >= bet.)
+        // Per official HighAPI docs, the callback response MUST be exactly:
+        //   { "credit_amount": max(0, bet_amount - win_amount), "timestamp": <13-digit ms> }
+        // credit_amount = NET AMOUNT DEDUCTED from the player (NOT the balance).
+        // Example from docs: bet 50, win 30 → credit_amount = 20. Win >= bet → 0.
+        const creditAmount = Math.max(0, Number((bet - win - refund).toFixed(2)));
         const responseBody = {
-            status: 1,
-            code: 0,
-            msg: "",
-            errCode: 0,
-            error_code: 0,
-            credit_amount: after,
-            balance: after,
-            current_balance: after,
-            player_balance: after,
-            available_balance: after,
-            timestamp: Date.now(),
-            // JILI/HighAPI seamless spec: provider reads payload.credit_amount (balance after txn)
-            payload: {
-                credit_amount: after.toFixed(2),
-                timestamp: String(Date.now())
-            }
+            credit_amount: creditAmount,
+            timestamp: Date.now()
         };
-        console.log(`[game-callback] FAST response credit_amount=${after} balance=${after} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
+        console.log(`[game-callback] FAST response credit_amount=${creditAmount} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
         res.json(responseBody);
 
         // === BACKGROUND DB WRITES (fire-and-forget) ===
