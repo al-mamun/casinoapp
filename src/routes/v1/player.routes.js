@@ -1808,23 +1808,11 @@ router.all("/game-callback", async (req, res) => {
             // Cached balance is preferred (instant); fall back to balanceBefore from the DB wallet.
             // Returning 0 here would cause the game to display 0 after every spin.
             const balanceVal = Number((getCachedBalance(user.id) ?? balanceBefore).toFixed(2));
+            // Same shape as the working integration's response
             const responseBody = {
-                status: 1,
-                code: 0,
-                msg: "",
-                errCode: 0,
-                error_code: 0,
-                credit_amount: balanceVal,
-                balance: balanceVal,
-                current_balance: balanceVal,
-                player_balance: balanceVal,
-                available_balance: balanceVal,
-                timestamp: Date.now(),
-                // JILI/HighAPI seamless spec: provider reads payload.credit_amount (balance after txn)
-                payload: {
-                    credit_amount: balanceVal.toFixed(2),
-                    timestamp: String(Date.now())
-                }
+                status: "success",
+                new_balance: balanceVal,
+                balance: balanceVal
             };
             console.log(`[game-callback] balance-check response userId=${user.id} balance=${balanceVal}`);
             res.json(responseBody);
@@ -1845,25 +1833,23 @@ router.all("/game-callback", async (req, res) => {
         const after = Number((before + delta).toFixed(2));
 
         if (after < 0) {
-            // Insufficient balance: per HighAPI doc shape, respond credit_amount=0 (nothing deducted)
-            const responseBody = { credit_amount: 0, timestamp: Date.now() };
-            await appendCallbackIssue(debugEntry, { status: 402, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
-            return res.status(402).json(responseBody);
+            // Insufficient balance: working integration returns HTTP 200 with status:"error"
+            const responseBody = { status: "error", message: "Insufficient balance", new_balance: Number(before.toFixed(2)) };
+            await appendCallbackIssue(debugEntry, { status: 200, body: responseBody }, { resolvedUserId: user.id, balanceBefore: before, balanceAfter: before });
+            return res.json(responseBody);
         }
 
         // Update cache immediately so next callback sees the new balance
         cacheWallet(user.id, after);
 
-        // Per official HighAPI docs, the callback response MUST be exactly:
-        //   { "credit_amount": max(0, bet_amount - win_amount), "timestamp": <13-digit ms> }
-        // credit_amount = NET AMOUNT DEDUCTED from the player (NOT the balance).
-        // Example from docs: bet 50, win 30 → credit_amount = 20. Win >= bet → 0.
-        const creditAmount = Math.max(0, Number((bet - win - refund).toFixed(2)));
+        // Response format confirmed from a WORKING HighAPI integration (callback.php):
+        //   { "status": "success", "new_balance": <player balance AFTER the transaction> }
+        // The motherpanel reads new_balance and displays it as the in-game balance.
         const responseBody = {
-            credit_amount: creditAmount,
-            timestamp: Date.now()
+            status: "success",
+            new_balance: Number(after.toFixed(2))
         };
-        console.log(`[game-callback] FAST response credit_amount=${creditAmount} bet=${bet} win=${win} before=${before} after=${after} settlementType=${settlementType}`);
+        console.log(`[game-callback] FAST response new_balance=${after} bet=${bet} win=${win} before=${before} settlementType=${settlementType}`);
         res.json(responseBody);
 
         // === BACKGROUND DB WRITES (fire-and-forget) ===
