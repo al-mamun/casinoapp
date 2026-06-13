@@ -25,7 +25,12 @@ const ALL_MODULES = [
     { name: 'PRIVILEGES', actions: ['VIEW', 'UPDATE', 'CLONE'] },
     { name: 'SURVEILLANCE', actions: ['VIEW', 'UPDATE'] },
     { name: 'COMPANY_PAYMENT', actions: ['VIEW', 'SETTLE', 'PAYOUT'] },
-    { name: 'WHITELABEL', actions: ['VIEW', 'CREATE', 'EDIT', 'LIMIT'] }
+    { name: 'WHITELABEL', actions: ['VIEW', 'CREATE', 'EDIT', 'LIMIT'] },
+    // Section-gate modules — controls which roles can access each User & Access nav section
+    { name: 'USER_MANAGEMENT', actions: ['VIEW'] },
+    { name: 'ROLE_MANAGEMENT', actions: ['VIEW'] },
+    { name: 'USER_ACCESS',     actions: ['VIEW'] },
+    { name: 'ACCESS_CONTROL',  actions: ['VIEW'] },
 ];
 
 // GET /api/v1/permissions/roles

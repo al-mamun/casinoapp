@@ -66,10 +66,17 @@ router.get("/", authenticate, authorize("PRIVILEGES:VIEW"), asyncHandler(async (
         return true;
     });
     // Clean up duplicates from DB asynchronously
+    // Must delete RolePermissions first (no cascade in MongoDB adapter)
     if (dupes.length > 0) {
-        Promise.all(dupes.map(id =>
-            Role.destroy({ where: { id } }).catch(() => {})
-        )).catch(() => {});
+        Promise.all(dupes.map(async (id) => {
+            try {
+                await RolePermission.destroy({ where: { roleId: id } });
+                await Role.destroy({ where: { id } });
+                console.log(`[roles] Cleaned duplicate role id=${id}`);
+            } catch (e) {
+                console.warn(`[roles] Failed to clean dupe id=${id}:`, e.message);
+            }
+        })).catch(() => {});
     }
 
     // Attach user counts per role
