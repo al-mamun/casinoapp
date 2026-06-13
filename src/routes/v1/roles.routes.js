@@ -31,13 +31,17 @@ const DEFAULT_ROLES = [
  */
 async function seedRoles() {
     try {
+        const existing = await Role.findAll({ attributes: ['name'] });
+        const existingNames = new Set(existing.map(r => r.name));
+        let seeded = 0;
         for (const r of DEFAULT_ROLES) {
-            const existing = await Role.findOne({ where: { name: r.name } });
-            if (!existing) {
+            if (!existingNames.has(r.name)) {
                 await Role.create({ name: r.name, level: r.level });
-                console.log(`[roles] Seeded role: ${r.name}`);
+                existingNames.add(r.name); // prevent re-insert in same loop
+                seeded++;
             }
         }
+        if (seeded > 0) console.log(`[roles] Seeded ${seeded} role(s)`);
     } catch (err) {
         console.warn("[roles] Seed failed:", err.message);
     }
@@ -50,6 +54,22 @@ router.get("/", authenticate, authorize("PRIVILEGES:VIEW"), asyncHandler(async (
     if (roles.length === 0) {
         await seedRoles();
         roles = await Role.findAll({ order: [["level", "ASC"]] });
+    }
+
+    // Deduplicate by name — keep only the first (lowest id) occurrence per name
+    // Removes duplicates caused by concurrent seed calls
+    const seen = new Set();
+    const dupes = [];
+    roles = roles.filter(r => {
+        if (seen.has(r.name)) { dupes.push(r.id); return false; }
+        seen.add(r.name);
+        return true;
+    });
+    // Clean up duplicates from DB asynchronously
+    if (dupes.length > 0) {
+        Promise.all(dupes.map(id =>
+            Role.destroy({ where: { id } }).catch(() => {})
+        )).catch(() => {});
     }
 
     // Attach user counts per role
