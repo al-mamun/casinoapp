@@ -79,17 +79,16 @@ router.get("/", authenticate, authorize("PRIVILEGES:VIEW"), asyncHandler(async (
         })).catch(() => {});
     }
 
-    // Attach user counts per role
+    // Attach user counts per role — use MongoDB aggregate (no full collection scan)
     const roleCounts = {};
     try {
-        const counts = await User.findAll({
-            where: { isDeleted: false },
-            attributes: ["role"],
-            raw: true
-        });
-        counts.forEach(u => {
-            const r = String(u.role || "").toUpperCase();
-            roleCounts[r] = (roleCounts[r] || 0) + 1;
+        const col = await User.collection();
+        const agg = await col.aggregate([
+            { $match: { isDeleted: { $ne: true } } },
+            { $group: { _id: '$role', count: { $sum: 1 } } }
+        ]).toArray();
+        agg.forEach(({ _id, count }) => {
+            if (_id) roleCounts[String(_id).toUpperCase()] = count;
         });
     } catch (_) {}
 
