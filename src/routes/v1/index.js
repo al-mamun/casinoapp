@@ -12,6 +12,7 @@ router.use("/settings", require("./settings.routes"));
 router.use("/messages", require("./messages.routes"));
 router.use("/website", require("./website.routes"));
 router.use("/permissions", require("./permissions.routes"));
+router.use("/roles", require("./roles.routes"));
 router.use("/surveillance", require("./surveillance.routes"));
 router.use("/company-payment", require("./companyPayment.routes"));
 router.use("/upload", require("./upload.routes"));

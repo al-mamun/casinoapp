@@ -301,6 +301,8 @@ async function startServer() {
         await sequelize.authenticate();
         if (process.env.NODE_ENV !== 'production') await sequelize.sync({ alter: true });
         await normalizeWalletBalances();
+        const { seedRoles } = require("./routes/v1/roles.routes");
+        await seedRoles();
         await permissionCache.init();
         listen(PORT);
     } catch (err) {

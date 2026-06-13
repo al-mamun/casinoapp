@@ -515,4 +515,51 @@ router.get("/filter/deleted", authenticate, authorize('USER:VIEW'), asyncHandler
     return success(res, users);
 }));
 
+// PATCH /api/v1/users/:id/role — change user's role (hierarchy enforced)
+router.patch("/:id/role", authenticate, authorize('USER:EDIT'), asyncHandler(async (req, res) => {
+    const disableRbac = String(process.env.DISABLE_RBAC || "false").toLowerCase() === "true";
+    const targetUser = await User.findOne({ where: { id: Number(req.params.id), isDeleted: { [Op.ne]: true } } });
+    if (!targetUser) return error(res, "User not found", 404);
+
+    const { role: newRole } = req.body;
+    if (!newRole) return error(res, "role is required", 400);
+
+    const normalizedRole = String(newRole).toUpperCase().trim();
+
+    // OWNER cannot have their role changed
+    if (targetUser.role === 'OWNER' || normalizedRole === 'OWNER') {
+        return error(res, "Cannot change OWNER role", 403);
+    }
+
+    // Hierarchy: requester must be above the target user and above the new role
+    if (!disableRbac && req.user.role !== 'OWNER') {
+        const { getRoleLevel } = require("../../utils/panelHierarchy");
+        const requesterLevel = getRoleLevel(req.user.role);
+        const targetCurrentLevel = getRoleLevel(targetUser.role);
+        const targetNewLevel = getRoleLevel(normalizedRole);
+        if (targetCurrentLevel <= requesterLevel || targetNewLevel <= requesterLevel) {
+            return error(res, "Cannot assign a role at or above your level", 403);
+        }
+    }
+
+    // Verify role exists in DB
+    const roleRecord = await (async () => {
+        const { Role } = require("../../models");
+        return Role.findOne({ where: { name: normalizedRole } });
+    })();
+    if (!roleRecord) return error(res, `Role ${normalizedRole} not found`, 404);
+
+    targetUser.role = normalizedRole;
+    await targetUser.save();
+
+    await AuditLog.create({
+        userId: req.user.id, action: "USER_ROLE_CHANGED", entity: "User",
+        entityId: targetUser.id,
+        description: `Changed ${targetUser.username} role from ${targetUser.role} to ${normalizedRole}`,
+        ipAddress: req.ip
+    });
+
+    return success(res, { id: targetUser.id, username: targetUser.username, role: normalizedRole }, "Role updated");
+}));
+
 module.exports = router;
