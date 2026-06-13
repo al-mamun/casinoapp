@@ -27,6 +27,9 @@ function normalizeId(value) {
 }
 
 function matchesValue(actual, expected) {
+    // Boolean false: treat missing/null field as false (matches docs that never had the field set)
+    if (expected === false && (actual === undefined || actual === null)) return true;
+
     if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
         const entries = [
             ...Object.entries(expected),
@@ -128,6 +131,12 @@ function idFilter(value) {
 function toMongoQuery(where = {}) {
     const query = {};
     for (const [key, expected] of Object.entries(where || {})) {
+        // Boolean false: use {$ne: true} so documents where the field is absent/null also match.
+        // This fixes queries like { isDeleted: false } when existing documents don't have the field set.
+        if (expected === false && !isIdLikeField(key)) {
+            query[key] = { $ne: true };
+            continue;
+        }
         if (expected instanceof Date || expected === null || !expected || typeof expected !== "object" || Array.isArray(expected)) {
             // For ID-like fields, match both numeric and string-stored values
             query[key] = isIdLikeField(key) ? idFilter(expected) : normalizeId(expected);

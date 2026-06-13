@@ -27,6 +27,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
+app.set('etag', false);  // Prevent 304 Not Modified — API clients get fresh JSON every time
 
 app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
