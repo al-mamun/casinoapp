@@ -8,6 +8,56 @@ const { success, error } = require("../../utils/apiResponse");
 const AuditLog = require("../../core/audit.engine");
 const { getVisibleMenus } = require("../../utils/rolePermissions");
 
+// POST /api/v1/auth/register — public self-registration, always creates PLAYER
+router.post("/register", asyncHandler(async (req, res) => {
+    const { username, password, referral_code, referralCode, fullName, phone, email } = req.body || {};
+
+    if (!username || !password) return error(res, "Username and password are required", 400);
+    if (String(username).trim().length < 4) return error(res, "Username must be at least 4 characters", 400);
+    if (String(password).length < 6) return error(res, "Password must be at least 6 characters", 400);
+
+    const exists = await User.findOne({ where: { username: String(username).trim() } });
+    if (exists) return error(res, "Username already taken", 409, "USERNAME_EXISTS");
+
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await User.create({
+        username:     String(username).trim(),
+        password:     hashed,
+        role:         'PLAYER',
+        fullName:     fullName || String(username).trim(),
+        phone:        phone  || null,
+        email:        email  || null,
+        referralCode: `PX${Date.now().toString().slice(-7)}`,
+        referredBy:   referral_code || referralCode || null,
+        isActive:     true,
+        status:       'active',
+    });
+
+    await Wallet.create({ userId: user.id, balance: 0 });
+
+    const token = generateToken(user);
+    await createSession(user.id, token, req.ip, req.headers['user-agent']);
+
+    await AuditLog.create({
+        userId: user.id,
+        action: 'REGISTER',
+        description: `New player registered: ${user.username}`,
+        ipAddress: req.ip,
+    });
+
+    return success(res, {
+        token,
+        user: {
+            id:       user.id,
+            username: user.username,
+            role:     user.role,
+            fullName: user.fullName,
+            balance:  0,
+        },
+        menus: getVisibleMenus('PLAYER'),
+    }, "Registration successful", 201);
+}));
+
 // POST /api/v1/auth/login
 router.post("/login", validate(loginSchema), asyncHandler(async (req, res) => {
     const { username, password } = req.body;
@@ -105,6 +155,34 @@ router.get("/me", authenticate, asyncHandler(async (req, res) => {
         ...user.toJSON(),
         menus: getVisibleMenus(menuRole)
     });
+}));
+
+// PATCH /api/v1/auth/me — update own profile (fullName, email, phone)
+router.patch("/me", authenticate, asyncHandler(async (req, res) => {
+    const { fullName, email, phone } = req.body;
+    const user = await User.findByPk(req.user.id);
+    if (!user) return error(res, "User not found", 404);
+
+    if (fullName !== undefined) user.fullName = String(fullName).trim();
+    if (email    !== undefined) user.email    = String(email).trim().toLowerCase() || null;
+    if (phone    !== undefined) user.phone    = String(phone).trim() || null;
+
+    await user.save();
+
+    await AuditLog.create({
+        userId: user.id,
+        action: "PROFILE_UPDATED",
+        description: "User updated own profile",
+        ipAddress: req.ip
+    });
+
+    return success(res, {
+        id:       user.id,
+        username: user.username,
+        fullName: user.fullName,
+        email:    user.email,
+        phone:    user.phone,
+    }, "Profile updated");
 }));
 
 // PATCH /api/v1/auth/change-password
