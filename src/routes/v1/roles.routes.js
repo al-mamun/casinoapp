@@ -45,7 +45,12 @@ async function seedRoles() {
 
 // GET /api/v1/roles — list all roles with user counts and permission count
 router.get("/", authenticate, authorize("PRIVILEGES:VIEW"), asyncHandler(async (req, res) => {
-    const roles = await Role.findAll({ order: [["level", "ASC"]] });
+    let roles = await Role.findAll({ order: [["level", "ASC"]] });
+    // Lazy seed: runs on Vercel where startServer() is skipped
+    if (roles.length === 0) {
+        await seedRoles();
+        roles = await Role.findAll({ order: [["level", "ASC"]] });
+    }
 
     // Attach user counts per role
     const roleCounts = {};
